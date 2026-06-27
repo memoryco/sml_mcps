@@ -17,3 +17,6 @@ Cargo.lock
 *.profdata
 lcov.info
 coverage/
+
+# AI semantic search index
+.ai-index/
