@@ -17,6 +17,9 @@ pub mod types;
 #[cfg(feature = "auth")]
 pub mod auth;
 
+#[cfg(unix)]
+pub mod bridge;
+
 // Re-export commonly used types
 pub use pagination::{DEFAULT_PAGE_SIZE, PageState, paginate};
 pub use server::{LogLevel, PromptDef, Resource, Server, ServerConfig, Tool, ToolEnv};
@@ -25,3 +28,9 @@ pub use types::*;
 
 #[cfg(feature = "http")]
 pub use transport::{HttpServer, HttpTransport};
+
+#[cfg(unix)]
+pub use bridge::Bridge;
+
+#[cfg(unix)]
+pub use transport::{UnixServer, UnixTransport};

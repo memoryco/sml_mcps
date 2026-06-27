@@ -52,6 +52,18 @@ impl Transport for StdioTransport {
         // Nothing to close for stdio
         Ok(())
     }
+
+    fn close_write(&mut self) -> Result<()> {
+        // Can't half-close stdout without ending the process; no-op. The bridge
+        // shutting down means main is about to return and the process exits.
+        Ok(())
+    }
+
+    fn try_clone_writer(&self) -> Option<Box<dyn Transport>> {
+        // stdin/stdout are process-global handles; a fresh StdioTransport
+        // writes to the same stdout. The bridge only ever calls write() on it.
+        Some(Box::new(StdioTransport::new()))
+    }
 }
 
 #[cfg(test)]
