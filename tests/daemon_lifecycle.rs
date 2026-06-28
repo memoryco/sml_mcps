@@ -176,8 +176,14 @@ fn test_serve_daemon_detaches() {
     assert!(status.success(), "daemon spawn should exit 0");
 
     // Socket and PID file should appear.
-    assert!(wait_for_file(&sock, Duration::from_secs(5)), "socket not created");
-    assert!(wait_for_file(&pid_file, Duration::from_secs(5)), "PID file not created");
+    assert!(
+        wait_for_file(&sock, Duration::from_secs(5)),
+        "socket not created"
+    );
+    assert!(
+        wait_for_file(&pid_file, Duration::from_secs(5)),
+        "PID file not created"
+    );
 
     // PID should be alive.
     let pid = read_pid(&pid_file).expect("couldn't read PID");
@@ -200,12 +206,16 @@ fn test_daemon_responds_to_tool_calls() {
         .unwrap();
     assert!(status.success());
 
-    let mut client = connect_retry(&sock, Duration::from_secs(5))
-        .expect("failed to connect to daemon");
+    let mut client =
+        connect_retry(&sock, Duration::from_secs(5)).expect("failed to connect to daemon");
     initialize(&mut client);
 
     let result = call_tool(&mut client, 2, "increment");
-    assert!(result.contains("counter"), "expected counter response, got: {}", result);
+    assert!(
+        result.contains("counter"),
+        "expected counter response, got: {}",
+        result
+    );
 
     let who = call_tool(&mut client, 3, "whoami");
     assert!(who.starts_with("conn-"), "expected conn-id, got: {}", who);

@@ -697,10 +697,7 @@ mod tests {
             let upstream = UnixTransport::connect(&sock).unwrap();
 
             let handle = thread::spawn(move || {
-                Bridge::run(
-                    UnixTransport::from_stream(client_bridge),
-                    upstream,
-                )
+                Bridge::run(UnixTransport::from_stream(client_bridge), upstream)
             });
 
             clients.push(UnixTransport::from_stream(client_peer));
@@ -731,12 +728,7 @@ mod tests {
                 vec![2, 1, 0]
             };
             for &i in &order {
-                let got = bridge_call_tool(
-                    &mut clients[i],
-                    round,
-                    "whoami",
-                    serde_json::json!({}),
-                );
+                let got = bridge_call_tool(&mut clients[i], round, "whoami", serde_json::json!({}));
                 assert_eq!(
                     got, conn_ids[i],
                     "bridge {} got conn_id {} but expected {} (round {})",

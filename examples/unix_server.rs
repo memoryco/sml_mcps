@@ -127,11 +127,8 @@ fn main() -> sml_mcps::Result<()> {
             let exe = exe.to_string_lossy().to_string();
 
             let sock_str = socket_path.to_string_lossy().to_string();
-            let upstream = Bridge::auto_start(
-                &socket_path,
-                &exe,
-                &["--daemon", "--socket", &sock_str],
-            )?;
+            let upstream =
+                Bridge::auto_start(&socket_path, &exe, &["--daemon", "--socket", &sock_str])?;
             Bridge::run(StdioTransport::new(), upstream)
         }
     }

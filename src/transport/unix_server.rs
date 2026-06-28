@@ -72,8 +72,14 @@ fn install_signal_handlers(
     let prev_term;
     let prev_int;
     unsafe {
-        prev_term = libc::signal(libc::SIGTERM, shutdown_signal_handler as *const () as libc::sighandler_t);
-        prev_int = libc::signal(libc::SIGINT, shutdown_signal_handler as *const () as libc::sighandler_t);
+        prev_term = libc::signal(
+            libc::SIGTERM,
+            shutdown_signal_handler as *const () as libc::sighandler_t,
+        );
+        prev_int = libc::signal(
+            libc::SIGINT,
+            shutdown_signal_handler as *const () as libc::sighandler_t,
+        );
     }
 
     let shared_clone = shared.clone();
@@ -84,10 +90,10 @@ fn install_signal_handlers(
         .spawn(move || {
             // Block until the signal handler writes, or the pipe closes.
             let mut buf = [0u8; 1];
-            let n = unsafe {
-                libc::read(sig_read, buf.as_mut_ptr() as *mut libc::c_void, 1)
-            };
-            unsafe { libc::close(sig_read); }
+            let n = unsafe { libc::read(sig_read, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+            unsafe {
+                libc::close(sig_read);
+            }
 
             if n > 0 {
                 // Signal received — trigger clean shutdown.
@@ -129,7 +135,9 @@ impl Drop for SignalGuard {
         // Close the write end — if the watcher is still blocked on read(),
         // it'll get EOF and exit cleanly.
         SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
-        unsafe { libc::close(self.write_fd); }
+        unsafe {
+            libc::close(self.write_fd);
+        }
 
         if let Some(w) = self.watcher.take() {
             let _ = w.join();
