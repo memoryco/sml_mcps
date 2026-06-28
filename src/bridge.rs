@@ -111,6 +111,20 @@ impl Bridge {
         let _ = client_writer.close_write();
         result
     }
+
+    /// Bridge stdio (stdin/stdout) to a Unix transport.
+    ///
+    /// This is the complete shim binary in one call: connects CC's stdio
+    /// transport to an upstream daemon.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let upstream = Bridge::auto_start("server.sock", "my-daemon", &["--daemon"])?;
+    /// Bridge::run_stdio(upstream)?;
+    /// ```
+    pub fn run_stdio(upstream: UnixTransport) -> Result<()> {
+        Self::run(crate::StdioTransport::new(), upstream)
+    }
 }
 
 /// Forward every message from `reader` to `writer` until end-of-stream.
@@ -573,6 +587,169 @@ mod tests {
 
         drop(transport);
         let _ = server.join();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    // ---- multi-bridge integration ----------------------------------------
+
+    /// Context that tracks its connection identity.
+    struct BridgeTestContext {
+        conn_id: String,
+    }
+
+    /// Returns the conn_id so we can verify each bridge reaches its own
+    /// daemon-side context.
+    struct BridgeWhoamiTool;
+    impl Tool<BridgeTestContext> for BridgeWhoamiTool {
+        fn name(&self) -> &str {
+            "whoami"
+        }
+        fn description(&self) -> &str {
+            "Return connection id"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn execute(
+            &self,
+            _a: Value,
+            ctx: &mut BridgeTestContext,
+            _e: &ToolEnv,
+        ) -> McpResult<CallToolResult> {
+            Ok(CallToolResult::text(ctx.conn_id.clone()))
+        }
+    }
+
+    /// Helper: send initialize handshake through a raw UnixTransport.
+    fn bridge_initialize(t: &mut UnixTransport, id: i64) {
+        let req = JsonRpcMessage::request(
+            id,
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            })),
+        );
+        t.write(&req).unwrap();
+        let resp = t.read().unwrap();
+        assert!(matches!(resp, JsonRpcMessage::Response(_)));
+    }
+
+    /// Helper: call a tool through a raw UnixTransport and return the text.
+    fn bridge_call_tool(t: &mut UnixTransport, id: i64, name: &str, args: Value) -> String {
+        let req = JsonRpcMessage::request(
+            id,
+            "tools/call",
+            Some(serde_json::json!({ "name": name, "arguments": args })),
+        );
+        t.write(&req).unwrap();
+        let resp = t.read().unwrap();
+        match resp {
+            JsonRpcMessage::Response(r) => {
+                let result = r.result.expect("expected result");
+                result["content"][0]["text"]
+                    .as_str()
+                    .expect("text content")
+                    .to_string()
+            }
+            other => panic!("expected response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_multi_bridge_concurrent_no_crosstalk() {
+        // End-to-end: 3 bridges (simulating 3 CC terminals with shims) all
+        // connected to the same daemon, sending interleaved requests.
+        // Verifies each bridge gets responses routed to the correct client.
+        let sock = temp_path("sock");
+        let sock_for_server = sock.clone();
+
+        // Stand up the daemon.
+        let _server = thread::spawn(move || {
+            UnixServer::new(ServerConfig::default())
+                .idle_timeout(Duration::from_secs(10))
+                .with_tools(|s: &mut Server<BridgeTestContext>| {
+                    s.add_tool(BridgeWhoamiTool)?;
+                    Ok(())
+                })
+                .serve(&sock_for_server, |conn_id| BridgeTestContext {
+                    conn_id: conn_id.to_string(),
+                })
+        });
+
+        // Wait for the daemon to be ready.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if UnixTransport::connect(&sock).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Spin up 3 bridges. Each one gets a UnixStream::pair() for the
+        // "client" side and a real connection to the daemon for the upstream.
+        let mut clients = Vec::new();
+        let mut bridge_handles = Vec::new();
+
+        for _ in 0..3 {
+            let (client_bridge, client_peer) = UnixStream::pair().unwrap();
+            let upstream = UnixTransport::connect(&sock).unwrap();
+
+            let handle = thread::spawn(move || {
+                Bridge::run(
+                    UnixTransport::from_stream(client_bridge),
+                    upstream,
+                )
+            });
+
+            clients.push(UnixTransport::from_stream(client_peer));
+            bridge_handles.push(handle);
+        }
+
+        // Initialize all three through their bridges.
+        for client in clients.iter_mut() {
+            bridge_initialize(client, 1);
+        }
+
+        // Each bridge should get a unique conn_id from the daemon.
+        let mut conn_ids: Vec<String> = Vec::new();
+        for client in clients.iter_mut() {
+            conn_ids.push(bridge_call_tool(client, 2, "whoami", serde_json::json!({})));
+        }
+        assert_ne!(conn_ids[0], conn_ids[1]);
+        assert_ne!(conn_ids[1], conn_ids[2]);
+        assert_ne!(conn_ids[0], conn_ids[2]);
+
+        // Interleave requests in a different order and verify each bridge
+        // still gets its own conn_id back — no cross-talk.
+        for round in 3..=5i64 {
+            // Reverse order each round to stress the routing.
+            let order: Vec<usize> = if round % 2 == 0 {
+                vec![0, 1, 2]
+            } else {
+                vec![2, 1, 0]
+            };
+            for &i in &order {
+                let got = bridge_call_tool(
+                    &mut clients[i],
+                    round,
+                    "whoami",
+                    serde_json::json!({}),
+                );
+                assert_eq!(
+                    got, conn_ids[i],
+                    "bridge {} got conn_id {} but expected {} (round {})",
+                    i, got, conn_ids[i], round
+                );
+            }
+        }
+
+        // Clean shutdown: drop all clients, bridges will see EOF and exit.
+        drop(clients);
+        for h in bridge_handles {
+            let _ = h.join();
+        }
         let _ = std::fs::remove_file(&sock);
     }
 }
