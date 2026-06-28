@@ -1,3 +1,17 @@
+## v0.5.0
+
+### Features
+
+- **Unix socket transport** — `UnixTransport` for reading/writing MCP over Unix domain sockets. Connect mode for clients, `from_stream` for servers.
+- **`UnixServer`** — daemon-style MCP server over Unix sockets. Thread-per-connection, `idle_timeout` for auto-shutdown, `conn_id`-based session isolation. Supports both foreground (`serve`) and daemonized (`serve_daemon`) modes.
+- **`Bridge`** — transparent bidirectional MCP proxy. `auto_start` handles daemon spawning, stale socket/PID detection, and connection. `run_stdio` convenience for one-line shims.
+- **Signal handling** — SIGTERM/SIGINT trigger clean daemon shutdown with socket and PID file cleanup via self-pipe pattern.
+- **Transport trait extensions** — `try_clone_writer` and `close_write` for deadlock-free full-duplex bridging (non-breaking, default impls provided).
+
+### Why
+
+MCP clients (e.g. Claude Code) spawn a fresh server process per session. For servers with heavy state — local ML models, agent registries — duplicating that per client is wasteful or broken. The daemon/shim pattern lets multiple clients share one server instance: a long-lived daemon holds the expensive state, lightweight shims proxy MCP traffic.
+
 ## v0.4.0
 
 ### Changes (feature)

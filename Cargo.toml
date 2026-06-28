@@ -1,6 +1,6 @@
 [package]
 name = "sml_mcps"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Small MCP Server - sync, no tokio, just works"
@@ -25,6 +25,11 @@ jsonwebtoken = { version = "9", optional = true }
 # HTTP server (tiny, sync, no deps)
 tiny_http = { version = "0.12", optional = true }
 
+# Unix daemon syscalls (fork, setsid, dup2, kill) for UnixServer::serve_daemon.
+# Unix-only, always available there - no feature flag (matches #[cfg(unix)] gating).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["schema"]
 schema = ["dep:schemars"]
@@ -44,3 +49,7 @@ required-features = ["http"]
 [[example]]
 name = "http_auth"
 required-features = ["hosted"]
+
+# Unix socket daemon/shim example - unix-only, no extra features needed
+[[example]]
+name = "unix_server"

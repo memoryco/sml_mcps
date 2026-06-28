@@ -86,6 +86,67 @@ fn main() -> Result<()> {
 }
 ```
 
+## Unix Socket Transport (Daemon/Shim)
+
+For servers with expensive state (ML models, indexes, agent registries), you don't want every client spawning its own instance. `UnixServer` runs a daemon that multiple clients share via lightweight shims.
+
+**Daemon** (one long-lived process):
+
+```rust
+use sml_mcps::{UnixServer, ServerConfig, Server, Tool, ToolEnv, CallToolResult, Result};
+use serde_json::Value;
+use std::time::Duration;
+
+struct AppContext { conn_id: String }
+
+struct PingTool;
+impl Tool<AppContext> for PingTool {
+    fn name(&self) -> &str { "ping" }
+    fn description(&self) -> &str { "Ping" }
+    fn schema(&self) -> Value { serde_json::json!({ "type": "object" }) }
+    fn execute(&self, _a: Value, ctx: &mut AppContext, _e: &ToolEnv) -> Result<CallToolResult> {
+        Ok(CallToolResult::text(format!("pong from {}", ctx.conn_id)))
+    }
+}
+
+fn main() -> Result<()> {
+    let config = ServerConfig {
+        name: "my-daemon".to_string(),
+        version: "1.0.0".to_string(),
+        ..Default::default()
+    };
+
+    UnixServer::new(config)
+        .idle_timeout(Duration::from_secs(300))  // exit after 5min idle
+        .with_tools(|s: &mut Server<AppContext>| {
+            s.add_tool(PingTool)?;
+            Ok(())
+        })
+        .serve_daemon("/tmp/my-daemon.sock", |conn_id| {
+            AppContext { conn_id: conn_id.to_string() }
+        })
+}
+```
+
+**Shim** (one per client, near-zero overhead):
+
+```rust
+use sml_mcps::{Bridge, Result};
+
+fn main() -> Result<()> {
+    let upstream = Bridge::auto_start(
+        "/tmp/my-daemon.sock",
+        "my-daemon",
+        &["--daemon"],
+    )?;
+    Bridge::run_stdio(upstream)
+}
+```
+
+`auto_start` connects to a running daemon, or starts one if needed (handling stale sockets and PID files). The shim is a transparent proxy — MCP over stdio on one side, Unix socket on the other.
+
+See `examples/unix_server.rs` for a complete single-binary daemon + shim.
+
 ## HTTP Transport (Streamable HTTP with SSE)
 
 With the `http` feature, `HttpServer` handles all the HTTP boilerplate for you:
