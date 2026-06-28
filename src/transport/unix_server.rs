@@ -20,13 +20,122 @@ use crate::types::{McpError, Result};
 use std::io::{self, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 /// Setup function type for configuring tools on each connection.
 type SetupFn<C> = Box<dyn Fn(&mut Server<C>) -> Result<()> + Send + Sync>;
+
+// ---- signal handling -----------------------------------------------------
+
+/// Write end of the self-pipe used by the signal handler. -1 when inactive.
+static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Signal handler: writes a byte to the self-pipe so the signal watcher
+/// thread can trigger a clean shutdown. Only uses async-signal-safe ops.
+extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
+    let fd = SIGNAL_WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe {
+            libc::write(fd, b"x" as *const u8 as *const libc::c_void, 1);
+        }
+    }
+}
+
+/// Create a pipe for signal delivery. Returns (read_fd, write_fd).
+fn create_signal_pipe() -> Result<(i32, i32)> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// Install SIGTERM/SIGINT handlers and spawn a watcher thread that triggers
+/// the existing shutdown mechanism (set `state.shutdown`, self-connect to
+/// unblock accept). Returns a handle to the watcher thread.
+///
+/// On drop/cleanup: close the pipe and reset the global fd, which causes
+/// the watcher thread to exit naturally.
+fn install_signal_handlers(
+    shared: &Arc<(Mutex<ConnState>, Condvar)>,
+    socket_path: &Path,
+) -> Result<SignalGuard> {
+    let (sig_read, sig_write) = create_signal_pipe()?;
+
+    // Publish the write fd so the signal handler can reach it.
+    SIGNAL_WRITE_FD.store(sig_write, Ordering::SeqCst);
+
+    // Register handlers. Save previous handlers for restoration.
+    let prev_term;
+    let prev_int;
+    unsafe {
+        prev_term = libc::signal(libc::SIGTERM, shutdown_signal_handler as *const () as libc::sighandler_t);
+        prev_int = libc::signal(libc::SIGINT, shutdown_signal_handler as *const () as libc::sighandler_t);
+    }
+
+    let shared_clone = shared.clone();
+    let socket_clone = socket_path.to_path_buf();
+
+    let watcher = thread::Builder::new()
+        .name("signal-watcher".into())
+        .spawn(move || {
+            // Block until the signal handler writes, or the pipe closes.
+            let mut buf = [0u8; 1];
+            let n = unsafe {
+                libc::read(sig_read, buf.as_mut_ptr() as *mut libc::c_void, 1)
+            };
+            unsafe { libc::close(sig_read); }
+
+            if n > 0 {
+                // Signal received — trigger clean shutdown.
+                let (lock, cv) = &*shared_clone;
+                if let Ok(mut state) = lock.lock() {
+                    state.shutdown = true;
+                    cv.notify_all();
+                }
+                // Unblock accept() via self-connect (same trick as idle_watcher).
+                let _ = UnixStream::connect(&socket_clone);
+            }
+        })
+        .map_err(|e| McpError::Internal(format!("failed to spawn signal watcher: {}", e)))?;
+
+    Ok(SignalGuard {
+        write_fd: sig_write,
+        prev_term,
+        prev_int,
+        watcher: Some(watcher),
+    })
+}
+
+/// RAII guard that restores signal handlers and cleans up the pipe on drop.
+struct SignalGuard {
+    write_fd: i32,
+    prev_term: libc::sighandler_t,
+    prev_int: libc::sighandler_t,
+    watcher: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        // Restore previous signal handlers.
+        unsafe {
+            libc::signal(libc::SIGTERM, self.prev_term);
+            libc::signal(libc::SIGINT, self.prev_int);
+        }
+
+        // Close the write end — if the watcher is still blocked on read(),
+        // it'll get EOF and exit cleanly.
+        SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
+        unsafe { libc::close(self.write_fd); }
+
+        if let Some(w) = self.watcher.take() {
+            let _ = w.join();
+        }
+    }
+}
 
 /// Monotonic source of per-connection identifiers.
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -165,9 +274,21 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
             McpError::Internal(format!("failed to bind {}: {}", socket_path.display(), e))
         })?;
 
-        // Daemon mode: now that we own the socket, publish the PID and detach
-        // stdio. Writing the PID after bind (not before) means the file only
-        // exists when we actually hold the socket - cleaner for stale detection.
+        let setup = setup.map(Arc::new);
+        let factory = Arc::new(context_factory);
+        let shared: Arc<(Mutex<ConnState>, Condvar)> =
+            Arc::new((Mutex::new(ConnState::default()), Condvar::new()));
+
+        // Signal handling: SIGTERM/SIGINT trigger a clean shutdown via the
+        // same self-connect mechanism the idle watcher uses. The SignalGuard
+        // restores previous handlers on drop. Installed BEFORE the PID file
+        // is written so that signals are handled from the moment external
+        // processes can discover the daemon's PID.
+        let _signal_guard = install_signal_handlers(&shared, &socket_path)?;
+
+        // Daemon mode: now that we own the socket and signal handlers are
+        // installed, publish the PID and detach stdio. Writing the PID after
+        // bind means the file only exists when we actually hold the socket.
         if let Some(ref pid) = pid_path {
             write_pid_file(pid)?;
             redirect_stdio_to_devnull()?;
@@ -178,11 +299,6 @@ impl<C: Send + Sync + 'static> UnixServer<C> {
             config.name,
             socket_path.display()
         );
-
-        let setup = setup.map(Arc::new);
-        let factory = Arc::new(context_factory);
-        let shared: Arc<(Mutex<ConnState>, Condvar)> =
-            Arc::new((Mutex::new(ConnState::default()), Condvar::new()));
 
         // Optional idle watcher: exits the daemon after `idle_timeout` of zero
         // connections. Wakes the accept loop by self-connecting the socket.
