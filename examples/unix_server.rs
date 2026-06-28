@@ -90,13 +90,18 @@ fn main() -> sml_mcps::Result<()> {
         Ok(())
     }
 
-    // Socket (and sibling PID file) live in the temp dir for the example.
-    let socket_path = std::env::temp_dir().join("sml_mcps_example.sock");
+    // Socket path: use --socket PATH if provided, else temp dir.
+    let args: Vec<String> = std::env::args().collect();
+    let socket_path = args
+        .iter()
+        .position(|a| a == "--socket")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("sml_mcps_example.sock"));
 
-    let mode = std::env::args().nth(1);
-    match mode.as_deref() {
+    let mode = args.get(1).map(|s| s.as_str());
+    match mode {
         Some("--daemon") | Some("--foreground") => {
-            // Daemon side: one shared counter for every connection.
             let counter = Arc::new(AtomicI64::new(0));
             let server = UnixServer::new(config())
                 .idle_timeout(Duration::from_secs(300))
@@ -107,7 +112,7 @@ fn main() -> sml_mcps::Result<()> {
                 counter: counter.clone(),
             };
 
-            if mode.as_deref() == Some("--daemon") {
+            if mode == Some("--daemon") {
                 server.serve_daemon(&socket_path, factory)
             } else {
                 eprintln!("Serving in foreground on {}", socket_path.display());
@@ -121,7 +126,12 @@ fn main() -> sml_mcps::Result<()> {
                 .map_err(|e| sml_mcps::McpError::Internal(format!("current_exe: {}", e)))?;
             let exe = exe.to_string_lossy().to_string();
 
-            let upstream = Bridge::auto_start(&socket_path, &exe, &["--daemon"])?;
+            let sock_str = socket_path.to_string_lossy().to_string();
+            let upstream = Bridge::auto_start(
+                &socket_path,
+                &exe,
+                &["--daemon", "--socket", &sock_str],
+            )?;
             Bridge::run(StdioTransport::new(), upstream)
         }
     }
