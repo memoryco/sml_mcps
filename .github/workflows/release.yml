@@ -2,6 +2,16 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version bump type (BREAKING.FEATURE.FIX)'
+        required: true
+        default: 'fix'
+        type: choice
+        options:
+          - fix
+          - feature
+          - breaking
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,41 +31,77 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Get version from Cargo.toml
-        id: version
-        run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Check tag doesn't already exist
-        run: |
-          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-            echo "Tag v${{ steps.version.outputs.version }} already exists. Bump the version in Cargo.toml first."
-            exit 1
-          fi
+      - name: Install cargo-edit
+        run: cargo install cargo-edit
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Tag release
+      - name: Map version type to semver
+        id: map
         run: |
-          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
+          # Map our naming to cargo-edit's expected values
+          # BREAKING.FEATURE.FIX -> major.minor.patch
+          case "${{ github.event.inputs.version }}" in
+            breaking) echo "bump=major" >> $GITHUB_OUTPUT ;;
+            feature)  echo "bump=minor" >> $GITHUB_OUTPUT ;;
+            fix)      echo "bump=patch" >> $GITHUB_OUTPUT ;;
+          esac
 
-      - name: Push tag
+      - name: Bump version
+        id: bump
         run: |
-          git push origin "v${{ steps.version.outputs.version }}"
+          cargo set-version --bump ${{ steps.map.outputs.bump }}
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Extract changelog for this version
+      - name: Generate changelog
         id: changelog
         run: |
-          # Pull the section for this version from CHANGELOG.md
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --reverse)
+          else
+            COMMITS=$(git log ${LAST_TAG}..HEAD --pretty=format:"- %s (%h)" --reverse)
+          fi
+          
+          echo "## v${{ steps.bump.outputs.version }}" > /tmp/notes.md
+          echo "" >> /tmp/notes.md
+          echo "### Changes (${{ github.event.inputs.version }})" >> /tmp/notes.md
+          echo "" >> /tmp/notes.md
+          echo "$COMMITS" >> /tmp/notes.md
+          
           {
             echo 'notes<<EOF'
-            awk '/^## v${{ steps.version.outputs.version }}$/,/^## v/' CHANGELOG.md | head -n -1
+            cat /tmp/notes.md
             echo 'EOF'
           } >> $GITHUB_OUTPUT
+
+      - name: Update CHANGELOG.md
+        run: |
+          if [ -f CHANGELOG.md ]; then
+            cat /tmp/notes.md > /tmp/new_changelog.md
+            echo "" >> /tmp/new_changelog.md
+            cat CHANGELOG.md >> /tmp/new_changelog.md
+            mv /tmp/new_changelog.md CHANGELOG.md
+          else
+            echo "# Changelog" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            cat /tmp/notes.md >> CHANGELOG.md
+          fi
+
+      - name: Commit and tag
+        run: |
+          git add Cargo.toml CHANGELOG.md Cargo.lock || true
+          git commit -m "chore: release v${{ steps.bump.outputs.version }}"
+          git tag -a "v${{ steps.bump.outputs.version }}" -m "Release v${{ steps.bump.outputs.version }}"
+
+      - name: Push changes
+        run: |
+          git push origin main
+          git push origin "v${{ steps.bump.outputs.version }}"
 
       - name: Publish to crates.io
         run: cargo publish
@@ -65,8 +111,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: v${{ steps.version.outputs.version }}
+          tag_name: v${{ steps.bump.outputs.version }}
+          name: v${{ steps.bump.outputs.version }}
           body: ${{ steps.changelog.outputs.notes }}
           draft: false
           prerelease: false
